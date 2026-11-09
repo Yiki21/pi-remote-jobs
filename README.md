@@ -3,8 +3,10 @@
 Install once for your Pi user:
 
 ```sh
-pi install npm:pi-remote-jobs
+pi install git:github.com/Yiki21/pi-remote-jobs@v0.1.0
 ```
+
+The npm package name is reserved in the source as `pi-remote-jobs`; npm publication is pending.
 
 Run `/reload` in existing Pi sessions. New sessions load it automatically. The package registers one tool, `remote`.
 File tools remain local. Linux execution hosts need SSH key authentication, bash, rsync, GNU coreutils and systemd.
