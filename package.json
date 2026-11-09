@@ -1,0 +1,42 @@
+{
+  "name": "pi-remote-jobs",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Project-configured remote jobs for Pi over SSH and systemd",
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "license": "MIT",
+  "author": "Yiki21",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Yiki21/pi-remote-jobs.git"
+  },
+  "homepage": "https://github.com/Yiki21/pi-remote-jobs#readme",
+  "bugs": {
+    "url": "https://github.com/Yiki21/pi-remote-jobs/issues"
+  },
+  "files": [
+    "index.ts",
+    "selftest.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
