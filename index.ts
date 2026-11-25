@@ -65,9 +65,17 @@ function createProject(ROOT: string, REGISTRY: string) {
     cpus?: string;
   }
 
+  interface Placement {
+    gb_per_core: number;
+    min_free_gb: number;
+    min_disk_gb: number;
+    max_io_pressure: number;
+  }
+
   interface Registry {
     hosts: HostEntry[];
     code_sync: { paths: string[]; exclude: string[]; max_size: string };
+    placement: Placement;
   }
 
   function loadRegistry(): Registry {
@@ -115,8 +123,29 @@ function createProject(ROOT: string, REGISTRY: string) {
         !cs.exclude.every((p) => typeof p === "string"))
     )
       throw new Error("invalid code_sync.exclude");
+    const pl = raw?.placement ?? {};
+    for (const k of [
+      "gb_per_core",
+      "min_free_gb",
+      "min_disk_gb",
+      "max_io_pressure",
+    ])
+      if (
+        pl[k] !== undefined &&
+        (!Number.isFinite(pl[k]) ||
+          pl[k] < 0 ||
+          (k === "gb_per_core" && pl[k] === 0) ||
+          (k === "max_io_pressure" && pl[k] > 100))
+      )
+        throw new Error(`invalid placement.${k}`);
     return {
       hosts,
+      placement: {
+        gb_per_core: pl.gb_per_core ?? 2,
+        min_free_gb: pl.min_free_gb ?? 4,
+        min_disk_gb: pl.min_disk_gb ?? 50,
+        max_io_pressure: pl.max_io_pressure ?? 20,
+      },
       code_sync: {
         paths: Array.isArray(cs.paths) ? cs.paths : [],
         exclude: Array.isArray(cs.exclude) ? cs.exclude : [],
@@ -327,17 +356,38 @@ function createProject(ROOT: string, REGISTRY: string) {
     ok: boolean;
     avail_gb?: number;
     nproc?: number;
+    load1?: number;
+    cpuset?: number; // cores in the host's allowed set
+    idle?: number; // idle cores in that set, sampled over 1 s
+    io_psi?: number; // /proc/pressure/io "full avg60", percent
+    mem_psi?: number; // /proc/pressure/memory "full avg60", percent
     jobs?: number;
-    disk_gb?: number;
+    disk_gb?: number; // free space under the project root
+    docker_disk_gb?: number; // free space under Docker's data root, when Docker answers
     error?: string;
   }
 
-  const PROBE = (
-    h: HostEntry,
-  ) => `echo AVAIL=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
-	echo NPROC=$(nproc --all)
+  // CPU idle is sampled from /proc/stat over 1 s, restricted to the cores jobs may use (`cpus`);
+  // iowait is not idle: IO stalls are measured by PSI instead.
+  const PROBE = (h: HostEntry) => `n=$(nproc --all); C='${h.cpus ?? ""}'
+	if [ -z "$C" ]; then C=0-$((n-1)); fi
+	echo AVAIL=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+	echo NPROC=$n
+	echo LOAD1=$(cut -d' ' -f1 /proc/loadavg)
 	echo JOBS=$(systemctl list-units --no-legend --plain '${unitPrefix()}-*' 2>/dev/null | grep -c ' running ')
 	echo DISK=$(df -BG --output=avail '${rootOf(h)}' 2>/dev/null | tail -1 | tr -dc 0-9)
+	psi() { awk '/^full/ { split($3, a, "="); print a[2] }' "/proc/pressure/$1" 2>/dev/null; }
+	echo IOPSI=$(psi io); echo MEMPSI=$(psi memory)
+	d=$(timeout 5 docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)
+	if [ -n "$d" ]; then v=$(df -BG --output=avail "$d" 2>/dev/null | tail -1 | tr -dc 0-9); if [ -n "$v" ]; then echo DDISK=$v; fi; fi
+	s1=$(grep '^cpu[0-9]' /proc/stat); sleep 1; s2=$(grep '^cpu[0-9]' /proc/stat)
+	printf '%s\\n--\\n%s\\n' "$s1" "$s2" | awk -v C="$C" '
+	BEGIN { m = split(C, p, ","); for (i = 1; i <= m; i++) { if (split(p[i], r, "-") == 2) { for (k = r[1]; k <= r[2]; k++) want[k] = 1 } else want[p[i] + 0] = 1 } }
+	/^--$/ { second = 1; next }
+	{ id = substr($1, 4) + 0; if (!(id in want)) next
+	  tot = 0; for (i = 2; i <= 9 && i <= NF; i++) tot += $i; idl = $5
+	  if (second) { dt = tot - T[id]; if (dt > 0) free += (idl - I[id]) / dt; cnt++ } else { T[id] = tot; I[id] = idl } }
+	END { printf "CPUSET=%d\\nIDLE=%.2f\\n", cnt, free }'
 	`;
 
   async function probe(h: HostEntry, signal?: AbortSignal): Promise<Probe> {
@@ -354,13 +404,59 @@ function createProject(ROOT: string, REGISTRY: string) {
       ok: true,
       avail_gb: kv.AVAIL,
       nproc: kv.NPROC,
+      load1: kv.LOAD1,
+      cpuset: kv.CPUSET,
+      idle: kv.IDLE,
+      io_psi: kv.IOPSI,
+      mem_psi: kv.MEMPSI,
       jobs: kv.JOBS,
       disk_gb: kv.DISK,
+      docker_disk_gb: kv.DDISK,
     };
   }
 
-  function score(p: Probe): number {
-    return (p.avail_gb ?? 0) - (p.host.reserve_gb ?? 0);
+  const diskFree = (p: Probe) =>
+    Math.min(p.disk_gb ?? 0, p.docker_disk_gb ?? Number.POSITIVE_INFINITY);
+
+  // Share of time not fully stalled on IO or memory (PSI "full avg60"; 1 when PSI is absent).
+  const unstalled = (p: Probe) =>
+    (1 - Math.min(p.io_psi ?? 0, 100) / 100) *
+    (1 - Math.min(p.mem_psi ?? 0, 100) / 100);
+
+  const memFree = (p: Probe) => (p.avail_gb ?? 0) - (p.host.reserve_gb ?? 0);
+
+  // Free cores in the allowed set; a run queue beyond the host's cores (load1 > nproc) counts
+  // against it in proportion to the set's share, so an oversubscribed host ranks below an idle one.
+  function cpuFree(p: Probe): number {
+    const n = p.nproc || 1;
+    const set = p.cpuset || n;
+    const over = Math.max(0, (p.load1 ?? 0) - n) * (set / n);
+    return (p.idle ?? 0) - over;
+  }
+
+  // Capacity in core-equivalents: the scarcer of free cores and free memory / gb_per_core,
+  // scaled down by IO and memory stalls (an oversubscribed host is pushed further down).
+  function score(p: Probe, pl: Placement): number {
+    const base = Math.min(cpuFree(p), memFree(p) / pl.gb_per_core);
+    const f = unstalled(p);
+    return base >= 0 ? base * f : base * (2 - f);
+  }
+
+  // Hosts under any floor (memory, disk, IO stall) still run work, but only after every healthy host.
+  function rank(probes: Probe[], pl: Placement): Probe[] {
+    const roomy = (p: Probe) =>
+      memFree(p) >= pl.min_free_gb &&
+      diskFree(p) >= pl.min_disk_gb &&
+      (p.io_psi ?? 0) <= pl.max_io_pressure
+        ? 1
+        : 0;
+    return [...probes].sort(
+      (a, b) =>
+        roomy(b) - roomy(a) ||
+        score(b, pl) - score(a, pl) ||
+        memFree(b) - memFree(a) ||
+        (a.jobs ?? 0) - (b.jobs ?? 0),
+    );
   }
 
   async function pickHost(
@@ -379,8 +475,7 @@ function createProject(ROOT: string, REGISTRY: string) {
       throw new Error(
         `no reachable host: ${probes.map((p) => p.error).join("; ")}`,
       );
-    ok.sort((a, b) => score(b) - score(a) || (a.jobs ?? 0) - (b.jobs ?? 0));
-    return ok[0];
+    return rank(ok, reg.placement)[0];
   }
 
   // Pinned host per session (in memory), reconstructed from the branch after a restart.
@@ -811,7 +906,7 @@ function createProject(ROOT: string, REGISTRY: string) {
             .filter(Boolean)
             .join(",");
           return p.ok
-            ? `${p.host.name}: up  free ${p.avail_gb} GB (reserve ${p.host.reserve_gb ?? 0})  ${p.nproc} cores  ${p.jobs} jobs  disk ${p.disk_gb} GB free ${flags}`
+            ? `${p.host.name}: up  free ${p.avail_gb} GB (reserve ${p.host.reserve_gb ?? 0})  ${p.nproc} cores  load ${p.load1}  idle ${(p.idle ?? 0).toFixed(1)}/${p.cpuset} allowed cores  io-stall ${p.io_psi ?? 0}%  mem-stall ${p.mem_psi ?? 0}%  score ${score(p, reg.placement).toFixed(1)}  ${p.jobs} jobs  disk ${p.disk_gb} GB free${p.docker_disk_gb !== undefined && p.docker_disk_gb !== p.disk_gb ? ` (docker ${p.docker_disk_gb} GB)` : ""} ${flags}`
             : `${p.host.name}: DOWN ${p.error} ${flags}`;
         });
         return result(rows.join("\n"), { action, pinned });

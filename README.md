@@ -28,6 +28,11 @@ for distinct projects. `local: true` runs on the Pi machine and always uses the 
 `reserve_gb` subtracts from available memory when selecting a host. `drain: true` excludes a host from new automatic
 placements. CPU affinity defaults to all host CPUs; set `cpus` for reserved cores.
 
+The optional `placement` object tunes host selection: `gb_per_core` (default 2) converts free memory into
+core-equivalents. A host ranks after every healthy host when its free memory after `reserve_gb` is below
+`min_free_gb` (default 4), when free space under the project root or Docker's data root is below `min_disk_gb`
+(default 50), or when its IO stall (`/proc/pressure/io` "full avg60", percent) exceeds `max_io_pressure` (default 20).
+
 The nearest parent `.pi` directory defines the project boundary. A nested project without `remote.json` fails
 without contacting a host. Configuration is read on every call; adding or draining hosts needs no reload.
 There is no global server fallback. Environment variables do not override project selection.
@@ -46,7 +51,12 @@ remote({action: "log", job: "build-server.0123456789", lines: 100})
 remote({action: "hosts"})
 ```
 
-The tool chooses a reachable host with the most available memory, then pins it per project and session.
+The tool chooses a reachable host with the most spare capacity, then pins it per project and session. Capacity is
+the smaller of free cores and free memory / `gb_per_core`, multiplied by the share of time the host is not fully
+stalled on IO or memory (PSI "full avg60" of `/proc/pressure/io` and `/proc/pressure/memory`). Free cores are the
+idle cores of the allowed `cpus` set (iowait is not idle), sampled from `/proc/stat` over one second, minus the share
+of any run queue beyond the host's cores (1-minute load average above `nproc`). Ties go to more free memory, then
+fewer running jobs. `remote({action: "hosts"})` shows load, idle cores, IO and memory stall, disk and the score.
 An explicit `host` affects only that call. A disappeared pinned host is replaced for new submissions.
 Jobs keep running after a connection drops or Pi exits. A call waits up to 290 seconds; the job has no tool-imposed
 time limit. Resume with `wait`. An unknown submission outcome returns its job id; inspect it before resubmitting.
